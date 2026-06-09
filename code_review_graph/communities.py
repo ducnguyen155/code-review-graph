@@ -294,7 +294,9 @@ def _detect_leiden(
 
     import os
     seed = int(os.environ.get("CRG_LEIDEN_SEED", _LEIDEN_SEED))
-    ig.set_random_number_generator(random.Random(seed))
+    # Deterministic seeding for benchmark reproducibility — community
+    # detection is not a security-sensitive context. nosec B311.
+    ig.set_random_number_generator(random.Random(seed))  # nosec B311
     partition = g.community_leiden(
         objective_function="modularity",
         weights="weight",
@@ -516,7 +518,9 @@ def _split_oversized(
             g.es["weight"] = ig_weights
             import os
             seed = int(os.environ.get("CRG_LEIDEN_SEED", _LEIDEN_SEED))
-            ig.set_random_number_generator(random.Random(seed))
+            # Deterministic seeding for benchmark reproducibility — community
+            # detection is not a security-sensitive context. nosec B311.
+            ig.set_random_number_generator(random.Random(seed))  # nosec B311
             partition = g.community_leiden(
                 objective_function="modularity",
                 weights="weight",

@@ -8,32 +8,19 @@
  * Uses `better-sqlite3` with prepared statements for performance.
  */
 
-import type BetterSqlite3 from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
-type DatabaseType = BetterSqlite3.Database;
+type DatabaseType = DatabaseSync;
 
-// Load better-sqlite3 with graceful error handling for ABI mismatches.
-// On WSL or mismatched Node.js versions, the native module may fail to load.
-// better-sqlite3 uses `export =` so we import the value via require() and
-// type it as the DatabaseConstructor.
-let Database: typeof import('better-sqlite3');
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  Database = require('better-sqlite3');
-} catch (err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  const isAbiMismatch = msg.includes('NODE_MODULE_VERSION')
-    || msg.includes('was compiled against')
-    || msg.includes('not a valid Win32');
-  if (isAbiMismatch) {
-    console.error(
-      '[code-review-graph] better-sqlite3 ABI mismatch. '
-      + 'Your VS Code uses a different Node.js version than the one '
-      + 'this extension was built for. '
-      + 'Try: cd ~/.vscode/extensions/code-review-graph-* && npm rebuild better-sqlite3'
-    );
+/**
+ * Normalize Windows file paths to ensure consistent drive letter casing (uppercase)
+ * and path separators (backslashes) for SQLite database queries.
+ */
+function normalizePath(filePath: string): string {
+  if (filePath && filePath.length >= 2 && filePath[1] === ':') {
+    return filePath[0].toUpperCase() + filePath.slice(1).replace(/\//g, '\\');
   }
-  throw err;
+  return filePath;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +53,7 @@ export interface GraphNode {
   modifiers: string | null;
   isTest: boolean;
   fileHash: string | null;
+  degree?: number;
 }
 
 export interface GraphEdge {
@@ -182,9 +170,13 @@ export class SqliteReader {
   }
 
   constructor(dbPath: string) {
-    this.db = new Database(dbPath, { readonly: true });
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('busy_timeout = 5000');
+    let uriPath = dbPath.replace(/\\/g, '/');
+    if (!uriPath.startsWith('/')) {
+      uriPath = '/' + uriPath;
+    }
+    uriPath = 'file://' + uriPath + '?mode=ro';
+    this.db = new DatabaseSync(uriPath);
+    this.db.exec('PRAGMA busy_timeout = 5000');
   }
 
   /**
@@ -197,7 +189,7 @@ export class SqliteReader {
       // Check that required tables exist
       const tables = this.db
         .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all() as Array<{ name: string }>;
+        .all() as unknown as Array<{ name: string }>;
       const tableNames = new Set(tables.map((t) => t.name));
 
       if (!tableNames.has('nodes') || !tableNames.has('edges')) {
@@ -208,7 +200,7 @@ export class SqliteReader {
       if (tableNames.has('metadata')) {
         const row = this.db
           .prepare("SELECT value FROM metadata WHERE key = 'schema_version'")
-          .get() as { value: string } | undefined;
+          .get() as unknown as { value: string } | undefined;
         if (row) {
           const version = parseInt(row.value, 10);
           // Must match LATEST_VERSION in code_review_graph/migrations.py
@@ -241,7 +233,7 @@ export class SqliteReader {
         .prepare(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes'"
         )
-        .get() as { name: string } | undefined;
+        .get() as unknown as { name: string } | undefined;
       return row !== undefined;
     } catch {
       return false;
@@ -258,26 +250,31 @@ export class SqliteReader {
       .prepare(
         "SELECT DISTINCT file_path FROM nodes WHERE kind = 'File' ORDER BY file_path"
       )
-      .all() as FilePathRow[];
+      .all() as unknown as FilePathRow[];
     return rows.map((r) => r.file_path);
   }
 
   /** All nodes in a file, ordered by line_start. */
   getNodesByFile(filePath: string): GraphNode[] {
+    const normalized = normalizePath(filePath);
     const rows = this._db()
       .prepare(
-        'SELECT * FROM nodes WHERE file_path = ? ORDER BY line_start'
+        'SELECT * FROM nodes WHERE file_path = ? COLLATE NOCASE ORDER BY line_start'
       )
-      .all(filePath) as NodeRow[];
-    return rows.map((r) => this._rowToNode(r));
+      .all(normalized) as unknown as NodeRow[];
+    return this._attachDegrees(rows.map((r) => this._rowToNode(r)));
   }
 
   /** Single node lookup by qualified_name. */
   getNode(qualifiedName: string): GraphNode | undefined {
     const row = this._db()
       .prepare('SELECT * FROM nodes WHERE qualified_name = ?')
-      .get(qualifiedName) as NodeRow | undefined;
-    return row ? this._rowToNode(row) : undefined;
+      .get(qualifiedName) as unknown as NodeRow | undefined;
+    if (!row) { return undefined; }
+    const node = this._rowToNode(row);
+    const degrees = this._getNodesDegrees([node.qualifiedName]);
+    node.degree = degrees[node.qualifiedName] || 0;
+    return node;
   }
 
   /**
@@ -287,15 +284,20 @@ export class SqliteReader {
    * span (i.e. the most specific / innermost enclosing node).
    */
   getNodeAtCursor(filePath: string, line: number): GraphNode | undefined {
+    const normalized = normalizePath(filePath);
     const row = this._db()
       .prepare(
         `SELECT * FROM nodes
-         WHERE file_path = ? AND line_start <= ? AND line_end >= ?
+         WHERE file_path = ? COLLATE NOCASE AND line_start <= ? AND line_end >= ?
          ORDER BY (line_end - line_start) ASC
          LIMIT 1`
       )
-      .get(filePath, line, line) as NodeRow | undefined;
-    return row ? this._rowToNode(row) : undefined;
+      .get(normalized, line, line) as unknown as NodeRow | undefined;
+    if (!row) { return undefined; }
+    const node = this._rowToNode(row);
+    const degrees = this._getNodesDegrees([node.qualifiedName]);
+    node.degree = degrees[node.qualifiedName] || 0;
+    return node;
   }
 
   /** LIKE search on name and qualified_name. */
@@ -305,8 +307,117 @@ export class SqliteReader {
       .prepare(
         'SELECT * FROM nodes WHERE name LIKE ? OR qualified_name LIKE ? LIMIT ?'
       )
-      .all(pattern, pattern, limit) as NodeRow[];
-    return rows.map((r) => this._rowToNode(r));
+      .all(pattern, pattern, limit) as unknown as NodeRow[];
+    return this._attachDegrees(rows.map((r) => this._rowToNode(r)));
+  }
+
+  /** Get nodes of a specific kind with a limit. */
+  getNodesByKind(kind: NodeKind, limit: number = 1000): GraphNode[] {
+    const rows = this._db()
+      .prepare('SELECT * FROM nodes WHERE kind = ? LIMIT ?')
+      .all(kind, limit) as unknown as NodeRow[];
+    return this._attachDegrees(rows.map((r) => this._rowToNode(r)));
+  }
+
+  /**
+   * Get nodes and edges around a specific file (1-hop neighborhood).
+   */
+  getNodesAroundFile(
+    filePath: string,
+    limit: number = 500
+  ): { nodes: GraphNode[]; edges: GraphEdge[] } {
+    const fileNodes = this.getNodesByFile(filePath);
+    if (fileNodes.length === 0) {
+      return { nodes: [], edges: [] };
+    }
+
+    const nodeMap = new Map<string, GraphNode>();
+    for (const node of fileNodes) {
+      nodeMap.set(node.qualifiedName, node);
+    }
+
+    const allEdges: GraphEdge[] = [];
+    const neighborQns = new Set<string>();
+
+    for (const node of fileNodes) {
+      const outgoing = this.getEdgesBySource(node.qualifiedName);
+      for (const e of outgoing) {
+        allEdges.push(e);
+        if (!nodeMap.has(e.targetQualified)) {
+          neighborQns.add(e.targetQualified);
+        }
+      }
+
+      const incoming = this.getEdgesByTarget(node.qualifiedName);
+      for (const e of incoming) {
+        allEdges.push(e);
+        if (!nodeMap.has(e.sourceQualified)) {
+          neighborQns.add(e.sourceQualified);
+        }
+      }
+    }
+
+    for (const qn of neighborQns) {
+      if (nodeMap.size >= limit) {
+        break;
+      }
+      const neighborNode = this.getNode(qn);
+      if (neighborNode) {
+        nodeMap.set(qn, neighborNode);
+      }
+    }
+
+    const finalNodes = [...nodeMap.values()];
+    const finalNodeQns = new Set(finalNodes.map((n) => n.qualifiedName));
+    const finalEdges = allEdges.filter(
+      (e) => finalNodeQns.has(e.sourceQualified) && finalNodeQns.has(e.targetQualified)
+    );
+
+    return {
+      nodes: this._attachDegrees(finalNodes),
+      edges: finalEdges,
+    };
+  }
+
+  /**
+   * Get the most connected nodes in the repository (hub nodes), sorted by
+   * the sum of incoming and outgoing edge counts, excluding CONTAINS edges.
+   */
+  getHubNodes(limit: number = 500): GraphNode[] {
+    const query = `
+      WITH edge_counts AS (
+        SELECT qualified_name, SUM(cnt) as degree FROM (
+          SELECT source_qualified as qualified_name, COUNT(*) as cnt 
+          FROM edges 
+          WHERE kind != 'CONTAINS' 
+          GROUP BY source_qualified
+          
+          UNION ALL
+          
+          SELECT target_qualified as qualified_name, COUNT(*) as cnt 
+          FROM edges 
+          WHERE kind != 'CONTAINS' 
+          GROUP BY target_qualified
+        ) 
+        GROUP BY qualified_name
+      )
+      SELECT n.*, COALESCE(ec.degree, 0) as degree
+      FROM nodes n
+      LEFT JOIN edge_counts ec ON n.qualified_name = ec.qualified_name
+      ORDER BY degree DESC
+      LIMIT ?
+    `;
+
+    interface HubNodeRow extends NodeRow {
+      degree: number;
+    }
+
+    const rows = this._db().prepare(query).all(limit) as unknown as HubNodeRow[];
+    return rows.map((r) => {
+      const node = this._rowToNode(r);
+      node.degree = r.degree;
+      return node;
+    });
   }
 
   // -----------------------------------------------------------------------
@@ -317,7 +428,7 @@ export class SqliteReader {
   getEdgesBySource(qualifiedName: string): GraphEdge[] {
     const rows = this._db()
       .prepare('SELECT * FROM edges WHERE source_qualified = ?')
-      .all(qualifiedName) as EdgeRow[];
+      .all(qualifiedName) as unknown as EdgeRow[];
     return rows.map((r) => this._rowToEdge(r));
   }
 
@@ -325,7 +436,7 @@ export class SqliteReader {
   getEdgesByTarget(qualifiedName: string): GraphEdge[] {
     const rows = this._db()
       .prepare('SELECT * FROM edges WHERE target_qualified = ?')
-      .all(qualifiedName) as EdgeRow[];
+      .all(qualifiedName) as unknown as EdgeRow[];
     return rows.map((r) => this._rowToEdge(r));
   }
 
@@ -345,7 +456,7 @@ export class SqliteReader {
          WHERE source_qualified IN (${placeholders})
            AND target_qualified IN (${placeholders})`
       )
-      .all(...qns, ...qns) as EdgeRow[];
+      .all(...qns, ...qns) as unknown as EdgeRow[];
     return rows.map((r) => this._rowToEdge(r));
   }
 
@@ -358,23 +469,23 @@ export class SqliteReader {
     const db = this._db();
 
     const totalNodes = (
-      db.prepare('SELECT COUNT(*) AS cnt FROM nodes').get() as CountRow
+      db.prepare('SELECT COUNT(*) AS cnt FROM nodes').get() as unknown as CountRow
     ).cnt;
 
     const totalEdges = (
-      db.prepare('SELECT COUNT(*) AS cnt FROM edges').get() as CountRow
+      db.prepare('SELECT COUNT(*) AS cnt FROM edges').get() as unknown as CountRow
     ).cnt;
 
     const nodesByKind: Record<string, number> = {};
     const nkRows = db
       .prepare('SELECT kind, COUNT(*) AS cnt FROM nodes GROUP BY kind')
-      .all() as KindCountRow[];
+      .all() as unknown as KindCountRow[];
     for (const r of nkRows) { nodesByKind[r.kind] = r.cnt; }
 
     const edgesByKind: Record<string, number> = {};
     const ekRows = db
       .prepare('SELECT kind, COUNT(*) AS cnt FROM edges GROUP BY kind')
-      .all() as KindCountRow[];
+      .all() as unknown as KindCountRow[];
     for (const r of ekRows) { edgesByKind[r.kind] = r.cnt; }
 
     const languages = (
@@ -382,13 +493,13 @@ export class SqliteReader {
         .prepare(
           "SELECT DISTINCT language FROM nodes WHERE language IS NOT NULL AND language != ''"
         )
-        .all() as LanguageRow[]
+        .all() as unknown as LanguageRow[]
     ).map((r) => r.language);
 
     const filesCount = (
       db
         .prepare("SELECT COUNT(*) AS cnt FROM nodes WHERE kind = 'File'")
-        .get() as CountRow
+        .get() as unknown as CountRow
     ).cnt;
 
     const lastUpdated = this.getMetadata('last_updated') ?? null;
@@ -397,7 +508,7 @@ export class SqliteReader {
     let embeddingsCount = 0;
     try {
       embeddingsCount = (
-        db.prepare('SELECT COUNT(*) AS cnt FROM embeddings').get() as CountRow
+        db.prepare('SELECT COUNT(*) AS cnt FROM embeddings').get() as unknown as CountRow
       ).cnt;
     } catch {
       // embeddings table does not exist -- that is fine
@@ -419,7 +530,7 @@ export class SqliteReader {
   getMetadata(key: string): string | undefined {
     const row = this._db()
       .prepare('SELECT value FROM metadata WHERE key = ?')
-      .get(key) as MetadataRow | undefined;
+      .get(key) as unknown as MetadataRow | undefined;
     return row?.value;
   }
 
@@ -501,7 +612,12 @@ export class SqliteReader {
     const allQns = new Set([...seeds, ...impacted]);
     const edges = allQns.size > 0 ? this.getEdgesAmong(allQns) : [];
 
-    return { changedNodes, impactedNodes, impactedFiles, edges };
+    return {
+      changedNodes: this._attachDegrees(changedNodes),
+      impactedNodes: this._attachDegrees(impactedNodes),
+      impactedFiles,
+      edges,
+    };
   }
 
   // -----------------------------------------------------------------------
@@ -538,15 +654,16 @@ export class SqliteReader {
         `SELECT * FROM nodes WHERE ${where} ` + // nosec
         'ORDER BY (line_end - line_start + 1) DESC LIMIT ?',
       )
-      .all(...params) as NodeRow[];
+      .all(...params) as unknown as NodeRow[];
 
-    return rows.map((r) => ({
+    const nodes = rows.map((r) => ({
       ...this._rowToNode(r),
       lineCount:
         r.line_start != null && r.line_end != null
           ? r.line_end - r.line_start + 1
           : 0,
     }));
+    return this._attachDegrees(nodes) as Array<GraphNode & { lineCount: number }>;
   }
 
   // -----------------------------------------------------------------------
@@ -591,5 +708,54 @@ export class SqliteReader {
       filePath: row.file_path,
       line: row.line ?? 0,
     };
+  }
+
+  private _getNodesDegrees(qns: string[]): Record<string, number> {
+    const degrees: Record<string, number> = {};
+    for (const qn of qns) {
+      degrees[qn] = 0;
+    }
+    if (qns.length === 0) { return degrees; }
+
+    const batchSize = 450;
+    const db = this._db();
+    for (let i = 0; i < qns.length; i += batchSize) {
+      const batch = qns.slice(i, i + batchSize);
+      const placeholders = batch.map(() => '?').join(',');
+
+      const rowsSrc = db
+        .prepare(
+          `SELECT source_qualified, COUNT(*) as cnt
+           FROM edges
+           WHERE source_qualified IN (${placeholders})
+           GROUP BY source_qualified`
+        )
+        .all(...batch) as unknown as Array<{ source_qualified: string; cnt: number }>;
+      for (const r of rowsSrc) {
+        degrees[r.source_qualified] = (degrees[r.source_qualified] || 0) + r.cnt;
+      }
+
+      const rowsTgt = db
+        .prepare(
+          `SELECT target_qualified, COUNT(*) as cnt
+           FROM edges
+           WHERE target_qualified IN (${placeholders})
+           GROUP BY target_qualified`
+        )
+        .all(...batch) as unknown as Array<{ target_qualified: string; cnt: number }>;
+      for (const r of rowsTgt) {
+        degrees[r.target_qualified] = (degrees[r.target_qualified] || 0) + r.cnt;
+      }
+    }
+    return degrees;
+  }
+
+  private _attachDegrees(nodes: GraphNode[]): GraphNode[] {
+    const qns = nodes.map((n) => n.qualifiedName);
+    const degrees = this._getNodesDegrees(qns);
+    for (const n of nodes) {
+      n.degree = degrees[n.qualifiedName] || 0;
+    }
+    return nodes;
   }
 }

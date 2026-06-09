@@ -129,6 +129,20 @@
       }
     ],
     "menus": {
+      "explorer/context": [
+        {
+          "command": "codeReviewGraph.showGraph",
+          "group": "codeReviewGraph@1",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "codeReviewGraph.showGraph",
+          "group": "codeReviewGraph@1",
+          "when": "resourceScheme == file"
+        }
+      ],
       "scm/title": [
         {
           "command": "codeReviewGraph.reviewChanges",
@@ -250,6 +264,23 @@
           "minimum": 10,
           "maximum": 5000,
           "description": "Maximum number of nodes to display in the graph visualization."
+        },
+        "codeReviewGraph.graph.defaultViewMode": {
+          "type": "string",
+          "default": "activeFile",
+          "enum": [
+            "activeFile",
+            "fileDependency",
+            "hubNodes",
+            "classes"
+          ],
+          "enumDescriptions": [
+            "Show graph around the currently active file in the editor (Context-Aware).",
+            "Show high-level file dependency graph (File/Module Graph).",
+            "Show most connected nodes (hub nodes) in the codebase.",
+            "Show class nodes (legacy/classes behavior)."
+          ],
+          "description": "Default view mode to display when the graph is loaded without a search query."
         }
       }
     },
@@ -295,17 +326,15 @@
     "test": "node --experimental-vm-modules node_modules/@vscode/test-electron/out/runTest.js"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/d3": "^7.4.3",
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.3.8",
     "@vscode/vsce": "^2.22.0",
-    "esbuild": "^0.20.0",
+    "esbuild": "^0.28.0",
     "typescript": "^5.3.3"
   },
   "dependencies": {
-    "better-sqlite3": "^12.4.1",
     "d3": "^7.9.0"
   }
 }

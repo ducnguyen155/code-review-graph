@@ -7,63 +7,14 @@
  */
 
 import * as d3 from "d3";
+import type { NodeKind, EdgeKind, GraphNode, GraphEdge, SimNode, SimLink } from "./graphTypes";
+import { GraphModel } from "./graphModel";
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
   getState(): unknown;
   setState(state: unknown): void;
 };
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-type NodeKind = "File" | "Class" | "Function" | "Test" | "Type";
-
-type EdgeKind =
-  | "CALLS"
-  | "IMPORTS_FROM"
-  | "INHERITS"
-  | "IMPLEMENTS"
-  | "TESTED_BY"
-  | "CONTAINS"
-  | "DEPENDS_ON";
-
-interface GraphNode {
-  id: number;
-  kind: NodeKind;
-  name: string;
-  qualifiedName: string;
-  filePath: string;
-  lineStart: number | null;
-  lineEnd: number | null;
-  language: string | null;
-  parentName: string | null;
-  params: string | null;
-  returnType: string | null;
-  modifiers: string | null;
-  isTest: boolean;
-  fileHash: string | null;
-}
-
-interface GraphEdge {
-  id: number;
-  kind: EdgeKind;
-  sourceQualified: string;
-  targetQualified: string;
-  filePath: string;
-  line: number;
-}
-
-/** D3 simulation node extends GraphNode with x/y/vx/vy. */
-interface SimNode extends d3.SimulationNodeDatum, GraphNode {}
-
-/** D3 simulation link with resolved source/target. */
-interface SimLink extends d3.SimulationLinkDatum<SimNode> {
-  kind: EdgeKind;
-  sourceQualified: string;
-  targetQualified: string;
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -121,17 +72,25 @@ const ALL_EDGE_KINDS: EdgeKind[] = [
   "DEPENDS_ON",
 ];
 
+const ALL_NODE_KINDS: NodeKind[] = [
+  "File",
+  "Class",
+  "Function",
+  "Test",
+  "Type",
+];
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
 const vscodeApi = acquireVsCodeApi();
 
-let allNodes: SimNode[] = [];
-let allEdges: SimLink[] = [];
-let nodeMap = new Map<string, SimNode>();
+// Centralized graph data model (Neo4j Browser pattern)
+const graphModel = new GraphModel();
 
 let visibleEdgeKinds = new Set<EdgeKind>(ALL_EDGE_KINDS);
+let visibleNodeKinds = new Set<NodeKind>(ALL_NODE_KINDS);
 let selectedNode: SimNode | null = null;
 let depthLimit = 0; // 0 = show all
 
@@ -144,7 +103,7 @@ let labelGroup: d3.Selection<SVGGElement, unknown, null, undefined>;
 let zoomBehavior: d3.ZoomBehavior<SVGSVGElement, unknown>;
 
 let linkSelection: d3.Selection<SVGLineElement, SimLink, SVGGElement, unknown>;
-let nodeSelection: d3.Selection<SVGPathElement, SimNode, SVGGElement, unknown>;
+let nodeSelection: d3.Selection<SVGGElement, SimNode, SVGGElement, unknown>;
 let labelSelection: d3.Selection<SVGTextElement, SimNode, SVGGElement, unknown>;
 
 let currentTheme: "dark" | "light" = "dark";
@@ -167,8 +126,8 @@ function init(): void {
 
 function createSvg(): void {
   const graphEl = document.getElementById("graph-area")!;
-  const width = graphEl.clientWidth || window.innerWidth;
-  const height = graphEl.clientHeight || window.innerHeight;
+  const width = graphEl.clientWidth || window.innerWidth || 800;
+  const height = graphEl.clientHeight || window.innerHeight || 600;
 
   svg = d3
     .select(graphEl)
@@ -201,7 +160,7 @@ function createSvg(): void {
 
   // Initialize empty selections
   linkSelection = linkGroup.selectAll<SVGLineElement, SimLink>("line");
-  nodeSelection = nodeGroup.selectAll<SVGPathElement, SimNode>("path.node-shape");
+  nodeSelection = nodeGroup.selectAll<SVGGElement, SimNode>("g.node-group");
   labelSelection = labelGroup.selectAll<SVGTextElement, SimNode>("text");
 
   // Zoom + pan
@@ -212,7 +171,20 @@ function createSvg(): void {
       container.attr("transform", event.transform.toString());
     });
 
-  svg.call(zoomBehavior);
+  svg.call(zoomBehavior).on("dblclick.zoom", null);
+
+  // Deselect if clicking on the background of the SVG
+  svg.on("click", (event) => {
+    if (event.target === svg.node()) {
+      if (selectedNode !== null) {
+        selectedNode = null;
+        updateDepthSliderState();
+        unhighlightAll();
+        nodeSelection.select(".node-shape").attr("stroke", "none");
+        buildGraph(false);
+      }
+    }
+  });
 
   // Resize handler
   const resizeObserver = new ResizeObserver(() => {
@@ -228,27 +200,13 @@ function createSvg(): void {
 // ---------------------------------------------------------------------------
 
 function setData(nodes: GraphNode[], edges: GraphEdge[]): void {
-  // Build SimNodes
-  allNodes = nodes.map((n) => ({ ...n } as SimNode));
-  nodeMap = new Map(allNodes.map((n) => [n.qualifiedName, n]));
-
-  // Build SimLinks, filtering to edges where both endpoints exist
-  allEdges = [];
-  for (const e of edges) {
-    const src = nodeMap.get(e.sourceQualified);
-    const tgt = nodeMap.get(e.targetQualified);
-    if (src && tgt) {
-      allEdges.push({
-        source: src,
-        target: tgt,
-        kind: e.kind,
-        sourceQualified: e.sourceQualified,
-        targetQualified: e.targetQualified,
-      });
-    }
-  }
+  // Reset graph model and load new data
+  graphModel.reset();
+  graphModel.addNodes(nodes.map((n) => ({ ...n } as SimNode)));
+  graphModel.addEdges(buildSimLinks(edges));
 
   // Reset depth filter
+  selectedNode = null;
   depthLimit = 0;
   const slider = document.getElementById("depth-slider") as HTMLInputElement | null;
   if (slider) {
@@ -265,7 +223,6 @@ function setData(nodes: GraphNode[], edges: GraphEdge[]): void {
   if (nodes.length === 0) {
     if (emptyState) emptyState.style.display = "block";
     if (graphArea) {
-      // Hide the SVG but keep the container
       const svgHide = graphArea.querySelector("svg");
       if (svgHide) svgHide.style.display = "none";
     }
@@ -276,9 +233,42 @@ function setData(nodes: GraphNode[], edges: GraphEdge[]): void {
   const svgEl = graphArea?.querySelector("svg");
   if (svgEl) svgEl.style.display = "";
 
-  buildGraph();
+  buildGraph(true);
 
   updateDepthSliderState();
+}
+
+function appendData(nodes: GraphNode[], edges: GraphEdge[], parentQualifiedName?: string): void {
+  // Hide empty state if active
+  const emptyState = document.getElementById("empty-state");
+  const graphArea = document.getElementById("graph-area");
+  if (emptyState) emptyState.style.display = "none";
+  const svgEl = graphArea?.querySelector("svg");
+  if (svgEl) svgEl.style.display = "";
+
+  const simNodes = nodes.map((n) => ({ ...n } as SimNode));
+  const simEdges = buildSimLinks(edges);
+
+  if (parentQualifiedName) {
+    // Use GraphModel's expand tracking (Neo4j pattern: addExpandedNodes)
+    graphModel.expandNode(parentQualifiedName, simNodes, simEdges);
+  } else {
+    graphModel.addNodes(simNodes);
+    graphModel.addEdges(simEdges);
+  }
+
+  buildGraph(true);
+}
+
+/** Convert raw GraphEdge[] from the extension host into SimLink[] for D3. */
+function buildSimLinks(edges: GraphEdge[]): SimLink[] {
+  return edges.map((e) => ({
+    source: e.sourceQualified as unknown as SimNode,
+    target: e.targetQualified as unknown as SimNode,
+    kind: e.kind,
+    sourceQualified: e.sourceQualified,
+    targetQualified: e.targetQualified,
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +276,8 @@ function setData(nodes: GraphNode[], edges: GraphEdge[]): void {
 // ---------------------------------------------------------------------------
 
 function getVisibleData(): { nodes: SimNode[]; links: SimLink[] } {
-  // Filter edges by visible kinds
-  let links = allEdges.filter((e) => visibleEdgeKinds.has(e.kind));
+  // Read from centralized graph model
+  let links = graphModel.getEdges().filter((e) => visibleEdgeKinds.has(e.kind));
 
   let nodes: SimNode[];
 
@@ -301,14 +291,8 @@ function getVisibleData(): { nodes: SimNode[]; links: SimLink[] } {
       const next = new Set<string>();
       for (const qn of frontier) {
         for (const link of links) {
-          const srcQn =
-            typeof link.source === "object"
-              ? (link.source as SimNode).qualifiedName
-              : link.sourceQualified;
-          const tgtQn =
-            typeof link.target === "object"
-              ? (link.target as SimNode).qualifiedName
-              : link.targetQualified;
+          const srcQn = link.sourceQualified;
+          const tgtQn = link.targetQualified;
 
           if (srcQn === qn && !reachable.has(tgtQn)) {
             reachable.add(tgtQn);
@@ -324,64 +308,69 @@ function getVisibleData(): { nodes: SimNode[]; links: SimLink[] } {
       if (frontier.size === 0) break;
     }
 
-    nodes = allNodes.filter((n) => reachable.has(n.qualifiedName));
+    nodes = graphModel.getNodes().filter((n) => reachable.has(n.qualifiedName));
     const reachableSet = reachable;
     links = links.filter((l) => {
-      const srcQn =
-        typeof l.source === "object"
-          ? (l.source as SimNode).qualifiedName
-          : l.sourceQualified;
-      const tgtQn =
-        typeof l.target === "object"
-          ? (l.target as SimNode).qualifiedName
-          : l.targetQualified;
-      return reachableSet.has(srcQn) && reachableSet.has(tgtQn);
+      return reachableSet.has(l.sourceQualified) && reachableSet.has(l.targetQualified);
     });
   } else {
-    nodes = [...allNodes];
+    nodes = [...graphModel.getNodes()];
   }
 
-  // Apply search filter
-  const searchInput = document.getElementById("search-input") as HTMLInputElement | null;
-  const query = searchInput?.value?.trim().toLowerCase() ?? "";
-  if (query.length > 0) {
-    const matchingQns = new Set(
-      nodes
-        .filter((n) => n.name.toLowerCase().includes(query) || n.qualifiedName.toLowerCase().includes(query))
-        .map((n) => n.qualifiedName)
-    );
-    // Keep matching nodes + their direct neighbors
-    const expanded = new Set(matchingQns);
-    for (const link of links) {
-      const srcQn =
-        typeof link.source === "object"
-          ? (link.source as SimNode).qualifiedName
-          : link.sourceQualified;
-      const tgtQn =
-        typeof link.target === "object"
-          ? (link.target as SimNode).qualifiedName
-          : link.targetQualified;
-      if (matchingQns.has(srcQn)) expanded.add(tgtQn);
-      if (matchingQns.has(tgtQn)) expanded.add(srcQn);
+  // Build parent map from CONTAINS edges
+  const parentMap = new Map<string, string>();
+  for (const edge of graphModel.getEdges()) {
+    if (edge.kind === "CONTAINS") {
+      parentMap.set(edge.targetQualified, edge.sourceQualified);
     }
-    nodes = nodes.filter((n) => expanded.has(n.qualifiedName));
-    links = links.filter((l) => {
-      const srcQn =
-        typeof l.source === "object"
-          ? (l.source as SimNode).qualifiedName
-          : l.sourceQualified;
-      const tgtQn =
-        typeof l.target === "object"
-          ? (l.target as SimNode).qualifiedName
-          : l.targetQualified;
-      return expanded.has(srcQn) && expanded.has(tgtQn);
-    });
   }
+
+  // Recursive visibility check: a node is visible if it is visible and all its parents
+  // currently loaded in the graph model are also visible.
+  const memo = new Map<string, boolean>();
+  const isNodeVisible = (qn: string): boolean => {
+    if (memo.has(qn)) return memo.get(qn)!;
+
+    // Avoid cycles
+    memo.set(qn, false);
+
+    const n = graphModel.findNode(qn);
+    if (!n) {
+      memo.set(qn, false);
+      return false;
+    }
+    if (!visibleNodeKinds.has(n.kind)) {
+      memo.set(qn, false);
+      return false;
+    }
+
+    const parentQn = parentMap.get(qn);
+    if (parentQn && graphModel.hasNode(parentQn)) {
+      const parentVisible = isNodeVisible(parentQn);
+      memo.set(qn, parentVisible);
+      return parentVisible;
+    }
+
+    memo.set(qn, true);
+    return true;
+  };
+
+  // Filter by visible node kinds and parent visibility hierarchy
+  nodes = nodes.filter((n) => isNodeVisible(n.qualifiedName));
+
+  // Filter links to connect only visible nodes
+  const nodeQns = new Set(nodes.map((n) => n.qualifiedName));
+  links = links.filter((l) => {
+    return nodeQns.has(l.sourceQualified) && nodeQns.has(l.targetQualified);
+  });
+
+  // Note: search filtering is handled server-side via the "search" command.
+  // The search input value is still read in buildGraph() for highlight styling only.
 
   return { nodes, links };
 }
 
-function buildGraph(): void {
+function buildGraph(runTicks: boolean = false): void {
   const { nodes, links } = getVisibleData();
 
   // Stop existing simulation
@@ -390,8 +379,8 @@ function buildGraph(): void {
   }
 
   const graphEl = document.getElementById("graph-area")!;
-  const width = graphEl.clientWidth || window.innerWidth;
-  const height = graphEl.clientHeight || window.innerHeight;
+  const width = graphEl.clientWidth || window.innerWidth || 800;
+  const height = graphEl.clientHeight || window.innerHeight || 600;
 
   // --- Links ---
   linkSelection = linkGroup
@@ -405,34 +394,103 @@ function buildGraph(): void {
 
   // --- Nodes ---
   nodeSelection = nodeGroup
-    .selectAll<SVGPathElement, SimNode>("path.node-shape")
+    .selectAll<SVGGElement, SimNode>("g.node-group")
     .data(nodes, (d) => d.qualifiedName)
-    .join("path")
-    .attr("class", "node-shape")
+    .join(
+      (enter) => {
+        const g = enter
+          .append("g")
+          .attr("class", "node-group")
+          .attr("cursor", "pointer")
+          .attr("tabindex", 0)
+          .attr("role", "button");
+        g.append("path").attr("class", "node-shape");
+        return g;
+      }
+    );
+
+  const searchInput = document.getElementById("search-input") as HTMLInputElement | null;
+  const query = searchInput?.value?.trim().toLowerCase() ?? "";
+
+  // Update inner shapes
+  nodeSelection.select("path.node-shape")
     .attr("d", (d) => d3.symbol().type(NODE_SHAPE[d.kind] ?? d3.symbolCircle).size(NODE_AREA[d.kind] ?? 314)()!)
     .attr("fill", (d) => NODE_COLOR[d.kind] ?? "#cdd6f4")
-    .attr("stroke", "none")
-    .attr("stroke-width", 2)
-    .attr("cursor", "pointer")
-    .on("click", (_event, d) => {
+    .attr("stroke", (d) => {
+      const isSelected = selectedNode && d.qualifiedName === selectedNode.qualifiedName;
+      const isSearchMatch = query.length > 0 && (
+        d.name.toLowerCase().includes(query) ||
+        d.qualifiedName.toLowerCase().includes(query)
+      );
+      if (isSelected || isSearchMatch) {
+        return "#e6edf3";
+      }
+      const isExpanded = graphModel.isExpanded(d.qualifiedName);
+      if (isExpanded) {
+        return currentTheme === "dark" ? "#ffffff" : "#24292f";
+      }
+      return "none";
+    })
+    .attr("stroke-width", (d) => {
+      const isSelected = selectedNode && d.qualifiedName === selectedNode.qualifiedName;
+      const isSearchMatch = query.length > 0 && (
+        d.name.toLowerCase().includes(query) ||
+        d.qualifiedName.toLowerCase().includes(query)
+      );
+      if (isSelected || isSearchMatch) {
+        return 2;
+      }
+      const isExpanded = graphModel.isExpanded(d.qualifiedName);
+      return isExpanded ? 2 : 0;
+    })
+    .attr("stroke-dasharray", (d) => {
+      const isSelected = selectedNode && d.qualifiedName === selectedNode.qualifiedName;
+      const isSearchMatch = query.length > 0 && (
+        d.name.toLowerCase().includes(query) ||
+        d.qualifiedName.toLowerCase().includes(query)
+      );
+      if (isSelected || isSearchMatch) {
+        return "none";
+      }
+      const isExpanded = graphModel.isExpanded(d.qualifiedName);
+      return isExpanded ? "3,3" : "none";
+    })
+    .attr("class", (d) => {
+      const isExpanded = graphModel.isExpanded(d.qualifiedName);
+      return isExpanded ? "node-shape node-shape-dashed" : "node-shape";
+    });
+
+  nodeSelection
+    .attr("aria-label", (d) => `${d.kind}: ${d.name}`)
+    .on("click", (event, d) => {
+      if (event.ctrlKey || event.metaKey) {
+        // Ctrl + Click to open the source file
+        vscodeApi.postMessage({
+          command: "nodeClicked",
+          qualifiedName: d.qualifiedName,
+          filePath: d.filePath,
+          lineStart: d.lineStart ?? 1,
+        });
+        return;
+      }
+
+      // Normal click to select node
       selectNode(d);
-      vscodeApi.postMessage({
-        command: "nodeClicked",
-        qualifiedName: d.qualifiedName,
-        filePath: d.filePath,
-        lineStart: d.lineStart ?? 1,
-      });
     })
     .on("dblclick", (_event, d) => {
-      // Center on node and expand depth by 1
-      selectNode(d);
-      depthLimit = Math.min(depthLimit + 1, 10);
-      const slider = document.getElementById("depth-slider") as HTMLInputElement | null;
-      if (slider) slider.value = String(depthLimit);
-      const depthValue = document.getElementById("depth-value");
-      if (depthValue) depthValue.textContent = String(depthLimit);
-      buildGraph();
-      centerOnNode(d);
+      if (!graphModel.isExpanded(d.qualifiedName)) {
+        // Request neighbor data from extension host
+        vscodeApi.postMessage({
+          command: "doubleClicked",
+          qualifiedName: d.qualifiedName,
+          kind: d.kind,
+          filePath: d.filePath,
+          existingQualifiedNames: Array.from(graphModel.getAllNodeQns()),
+        });
+      } else {
+        graphModel.collapseNode(d.qualifiedName);
+        buildGraph(true);
+      }
     })
     .on("mouseenter", (_event, d) => {
       showTooltip(d);
@@ -444,7 +502,7 @@ function buildGraph(): void {
     })
     .call(
       d3
-        .drag<SVGPathElement, SimNode>()
+        .drag<SVGGElement, SimNode>()
         .on("start", (event, d) => {
           if (!event.active) simulation?.alphaTarget(0.3).restart();
           d.fx = d.x;
@@ -456,8 +514,9 @@ function buildGraph(): void {
         })
         .on("end", (event, d) => {
           if (!event.active) simulation?.alphaTarget(0);
-          d.fx = null;
-          d.fy = null;
+          // Keep the node pinned at its dragged position to prevent automatic drifting
+          d.fx = d.x;
+          d.fy = d.y;
         })
     )
     .attr("tabindex", 0)
@@ -466,18 +525,38 @@ function buildGraph(): void {
     .on("keydown", (event: KeyboardEvent, d: SimNode) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
-        selectNode(d);
-        vscodeApi.postMessage({
-          command: "nodeClicked",
-          qualifiedName: d.qualifiedName,
-          filePath: d.filePath,
-          lineStart: d.lineStart ?? 1,
-        });
+        if (event.ctrlKey || event.metaKey) {
+          // Ctrl + Enter or Ctrl + Space opens file
+          vscodeApi.postMessage({
+            command: "nodeClicked",
+            qualifiedName: d.qualifiedName,
+            filePath: d.filePath,
+            lineStart: d.lineStart ?? 1,
+          });
+        } else {
+          // Normal Enter or Space selects and toggles expand/collapse
+          selectNode(d);
+          if (!graphModel.isExpanded(d.qualifiedName)) {
+            // Request neighbor data from extension host
+            vscodeApi.postMessage({
+              command: "doubleClicked",
+              qualifiedName: d.qualifiedName,
+              kind: d.kind,
+              filePath: d.filePath,
+              existingQualifiedNames: Array.from(graphModel.getAllNodeQns()),
+            });
+          } else {
+            graphModel.collapseNode(d.qualifiedName);
+            buildGraph(true);
+          }
+        }
       } else if (event.key === "Escape") {
         event.preventDefault();
         selectedNode = null;
+        updateDepthSliderState();
         unhighlightAll();
-        nodeSelection.attr("stroke", "none");
+        nodeSelection.select(".node-shape").attr("stroke", "none");
+        buildGraph(false);
       } else if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
         event.preventDefault();
         const visibleNodes = nodeSelection.data();
@@ -499,7 +578,7 @@ function buildGraph(): void {
           }
         }
         if (best) {
-          const target = nodeGroup.selectAll<SVGPathElement, SimNode>("path.node-shape")
+          const target = nodeGroup.selectAll<SVGGElement, SimNode>("g.node-group")
             .filter((n) => n.qualifiedName === best!.qualifiedName)
             .node();
           if (target) (target as HTMLElement).focus();
@@ -515,38 +594,21 @@ function buildGraph(): void {
       unhighlightAll();
     });
 
-  // Highlight search matches
-  const searchInput = document.getElementById("search-input") as HTMLInputElement | null;
-  const query = searchInput?.value?.trim().toLowerCase() ?? "";
-  if (query.length > 0) {
-    nodeSelection.attr("stroke", (d) => {
-      const matches =
-        d.name.toLowerCase().includes(query) ||
-        d.qualifiedName.toLowerCase().includes(query);
-      return matches ? "#e6edf3" : "none";
-    });
-  }
 
-  // Highlight selected node
-  if (selectedNode) {
-    nodeSelection.attr("stroke", (d) => {
-      if (d.qualifiedName === selectedNode!.qualifiedName) return "#e6edf3";
-      if (query.length > 0) {
-        const matches =
-          d.name.toLowerCase().includes(query) ||
-          d.qualifiedName.toLowerCase().includes(query);
-        return matches ? "#e6edf3" : "none";
-      }
-      return "none";
-    });
-  }
 
   // --- Labels ---
   labelSelection = labelGroup
     .selectAll<SVGTextElement, SimNode>("text")
     .data(nodes, (d) => d.qualifiedName)
     .join("text")
-    .text((d) => d.name)
+    .text((d) => {
+      if (d.kind === "File") {
+        // Only show the filename for file nodes
+        const parts = d.name.replace(/\\/g, "/").split("/");
+        return parts.pop() || d.name;
+      }
+      return d.name;
+    })
     .attr("font-size", 10)
     .attr("fill", currentTheme === "dark" ? "#cdd6f4" : "#4c4f69")
     .attr("text-anchor", "middle")
@@ -562,25 +624,69 @@ function buildGraph(): void {
       d3
         .forceLink<SimNode, SimLink>(links)
         .id((d) => d.qualifiedName)
-        .distance(100)
+        .distance((d) => (d.kind === "CONTAINS" ? 60 : 180))
     )
-    .force("charge", d3.forceManyBody<SimNode>().strength(-200))
-    .force("center", d3.forceCenter(width / 2, height / 2))
+    .force(
+      "charge",
+      d3.forceManyBody<SimNode>().strength((d) => (d.kind === "File" ? -1000 : -500))
+    )
+    .force(
+      "x",
+      d3.forceX<SimNode>(width / 2).strength(0.02)
+    )
+    .force(
+      "y",
+      d3.forceY<SimNode>(height / 2).strength(0.02)
+    )
     .force(
       "collide",
-      d3.forceCollide<SimNode>().radius((d) => (NODE_RADIUS[d.kind] ?? 10) + 5)
-    )
-    .on("tick", () => {
-      linkSelection
-        .attr("x1", (d) => (d.source as SimNode).x!)
-        .attr("y1", (d) => (d.source as SimNode).y!)
-        .attr("x2", (d) => (d.target as SimNode).x!)
-        .attr("y2", (d) => (d.target as SimNode).y!);
+      d3.forceCollide<SimNode>().radius((d) => {
+        // Prevent label overlap by reserving extra space.
+        // File nodes have longer text labels, so they need a larger collision radius.
+        const baseRadius = NODE_RADIUS[d.kind] ?? 10;
+        if (d.kind === "File") {
+          return baseRadius + 50;
+        } else if (d.kind === "Class") {
+          return baseRadius + 35;
+        } else {
+          return baseRadius + 22;
+        }
+      })
+    );
 
-      nodeSelection.attr("transform", (d) => `translate(${d.x},${d.y})`);
+  // Only add center force if we are running ticks to prevent shifting coordinates during initialization
+  if (runTicks) {
+    simulation.force("center", d3.forceCenter(width / 2, height / 2));
+  }
 
-      labelSelection.attr("x", (d) => d.x!).attr("y", (d) => d.y!);
-    });
+  // Define DOM update callback
+  const updatePositions = () => {
+    linkSelection
+      .attr("x1", (d) => (d.source as SimNode).x!)
+      .attr("y1", (d) => (d.source as SimNode).y!)
+      .attr("x2", (d) => (d.target as SimNode).x!)
+      .attr("y2", (d) => (d.target as SimNode).y!);
+
+    nodeSelection.attr("transform", (d) => `translate(${d.x},${d.y})`);
+
+    labelSelection.attr("x", (d) => d.x!).attr("y", (d) => d.y!);
+  };
+
+  // Run simulation ticks synchronously to avoid entry wiggling animation
+  if (runTicks) {
+    for (let i = 0; i < 120; ++i) {
+      simulation.tick();
+    }
+  }
+
+  // Stop the simulation timer to prevent background wiggling/drifting
+  simulation.stop();
+
+  // Perform initial render once at settled positions
+  updatePositions();
+
+  // Bind updatePositions to tick for subsequent interactive changes (e.g. dragging)
+  simulation.on("tick", updatePositions);
 
   // Update node count display
   const countEl = document.getElementById("node-count");
@@ -595,9 +701,7 @@ function buildGraph(): void {
 
 function selectNode(node: SimNode): void {
   selectedNode = node;
-  nodeSelection.attr("stroke", (d) =>
-    d.qualifiedName === node.qualifiedName ? "#e6edf3" : "none"
-  );
+  buildGraph(false);
   updateDepthSliderState();
 }
 
@@ -607,9 +711,14 @@ function updateDepthSliderState(): void {
   if (slider) {
     if (selectedNode) {
       slider.disabled = false;
+      if (depthValue) {
+        depthValue.textContent = depthLimit === 0 ? "All" : String(depthLimit);
+      }
     } else {
       slider.disabled = true;
-      if (depthValue) depthValue.textContent = "N/A";
+      if (depthValue) {
+        depthValue.textContent = "N/A";
+      }
     }
   }
 }
@@ -652,8 +761,28 @@ function showTooltip(node: SimNode): void {
   tooltip.style.display = "block";
 
   let html = `<strong>${escapeHtml(node.name)}</strong><br/>`;
-  html += `<span class="tooltip-kind">${escapeHtml(node.kind)}</span><br/>`;
-  html += `<span class="tooltip-path">${escapeHtml(node.filePath)}</span>`;
+  html += `<span class="tooltip-kind">${escapeHtml(node.kind)}</span>`;
+
+  // Calculate expand/collapse status
+  const qn = node.qualifiedName;
+  const modelEdges = graphModel.getEdges();
+  let edgesInGraphCount = 0;
+  for (const e of modelEdges) {
+    if (e.sourceQualified === qn || e.targetQualified === qn) {
+      edgesInGraphCount++;
+    }
+  }
+  const dbDegree = node.degree ?? 0;
+  const isExpanded = graphModel.isExpanded(qn);
+  if (isExpanded) {
+    html += ` <span class="tooltip-status status-expanded">Expanded</span>`;
+  } else if (edgesInGraphCount < dbDegree) {
+    html += ` <span class="tooltip-status status-expandable">Expandable (+${dbDegree - edgesInGraphCount})</span>`;
+  } else if (dbDegree > 0) {
+    html += ` <span class="tooltip-status status-expanded">Expanded</span>`;
+  }
+
+  html += `<br/><span class="tooltip-path">${escapeHtml(node.filePath)}</span>`;
   if (node.lineStart != null) {
     html += `<br/>Lines ${node.lineStart}`;
     if (node.lineEnd != null && node.lineEnd !== node.lineStart) {
@@ -704,7 +833,7 @@ function escapeHtml(text: string): string {
 // ---------------------------------------------------------------------------
 
 function highlightNodeByName(qualifiedName: string): void {
-  const node = nodeMap.get(qualifiedName);
+  const node = graphModel.findNode(qualifiedName);
   if (!node) return;
 
   selectNode(node);
@@ -776,12 +905,12 @@ function centerOnNode(node: SimNode): void {
     .call(zoomBehavior.transform, transform);
 }
 
-function fitToView(): void {
+function fitToView(instant: boolean = false): void {
   const graphEl = document.getElementById("graph-area")!;
-  const width = graphEl.clientWidth;
-  const height = graphEl.clientHeight;
+  const width = graphEl.clientWidth || window.innerWidth || 800;
+  const height = graphEl.clientHeight || window.innerHeight || 600;
 
-  if (allNodes.length === 0) return;
+  if (graphModel.nodeCount === 0) return;
 
   // Find bounding box of visible nodes
   const visibleNodes = nodeSelection.data();
@@ -799,10 +928,12 @@ function fitToView(): void {
 
   if (!isFinite(minX)) return;
 
-  const padding = 60;
+  // Use tighter padding and larger scale limit for very small graphs to ensure readability
+  const padding = visibleNodes.length < 5 ? 30 : 60;
   const bboxWidth = maxX - minX + padding * 2;
   const bboxHeight = maxY - minY + padding * 2;
-  const scale = Math.min(width / bboxWidth, height / bboxHeight, 2);
+  const maxScale = visibleNodes.length < 5 ? 4 : 2;
+  const scale = Math.min(width / bboxWidth, height / bboxHeight, maxScale);
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
 
@@ -811,10 +942,14 @@ function fitToView(): void {
     .scale(scale)
     .translate(-cx, -cy);
 
-  svg
-    .transition()
-    .duration(500)
-    .call(zoomBehavior.transform, transform);
+  if (instant) {
+    svg.call(zoomBehavior.transform, transform);
+  } else {
+    svg
+      .transition()
+      .duration(500)
+      .call(zoomBehavior.transform, transform);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -829,8 +964,12 @@ function bindToolbarEvents(): void {
     searchInput.addEventListener("input", () => {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        buildGraph();
-      }, 250);
+        const query = searchInput.value;
+        vscodeApi.postMessage({
+          command: "search",
+          query: query,
+        });
+      }, 300);
     });
   }
 
@@ -848,7 +987,7 @@ function bindToolbarEvents(): void {
           pill.classList.add("active");
           pill.setAttribute("aria-pressed", "true");
         }
-        buildGraph();
+        buildGraph(false);
       };
       pill.addEventListener("click", toggle);
       pill.addEventListener("keydown", (ev) => {
@@ -857,7 +996,30 @@ function bindToolbarEvents(): void {
     }
   }
 
-  // Edge filter popover toggle
+  // Node toggle pills
+  for (const kind of ALL_NODE_KINDS) {
+    const pill = document.getElementById(`node-${kind}`);
+    if (pill) {
+      const toggle = () => {
+        if (visibleNodeKinds.has(kind)) {
+          visibleNodeKinds.delete(kind);
+          pill.classList.remove("active");
+          pill.setAttribute("aria-pressed", "false");
+        } else {
+          visibleNodeKinds.add(kind);
+          pill.classList.add("active");
+          pill.setAttribute("aria-pressed", "true");
+        }
+        buildGraph(false);
+      };
+      pill.addEventListener("click", toggle);
+      pill.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); }
+      });
+    }
+  }
+
+  // Edge & Node filter popover toggles
   const edgeFilterBtn = document.getElementById("btn-edge-filter");
   const edgePopover = document.getElementById("edge-popover");
   if (edgeFilterBtn && edgePopover) {
@@ -865,12 +1027,25 @@ function bindToolbarEvents(): void {
       e.stopPropagation();
       edgePopover.classList.toggle("visible");
     });
-    document.addEventListener("click", (e) => {
-      if (!edgePopover.contains(e.target as Node) && e.target !== edgeFilterBtn) {
-        edgePopover.classList.remove("visible");
-      }
+  }
+
+  const nodeFilterBtn = document.getElementById("btn-node-filter");
+  const nodePopover = document.getElementById("node-popover");
+  if (nodeFilterBtn && nodePopover) {
+    nodeFilterBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      nodePopover.classList.toggle("visible");
     });
   }
+
+  document.addEventListener("click", (e) => {
+    if (edgePopover && !edgePopover.contains(e.target as Node) && e.target !== edgeFilterBtn) {
+      edgePopover.classList.remove("visible");
+    }
+    if (nodePopover && !nodePopover.contains(e.target as Node) && e.target !== nodeFilterBtn) {
+      nodePopover.classList.remove("visible");
+    }
+  });
 
   // Depth slider
   const depthSlider = document.getElementById("depth-slider") as HTMLInputElement | null;
@@ -881,7 +1056,7 @@ function bindToolbarEvents(): void {
       if (depthValue) {
         depthValue.textContent = depthLimit === 0 ? "All" : String(depthLimit);
       }
-      buildGraph();
+      buildGraph(false);
     });
   }
 
@@ -890,6 +1065,19 @@ function bindToolbarEvents(): void {
   if (fitBtn) {
     fitBtn.addEventListener("click", () => {
       fitToView();
+    });
+  }
+
+  // Rearrange button
+  const rearrangeBtn = document.getElementById("btn-rearrange");
+  if (rearrangeBtn) {
+    rearrangeBtn.addEventListener("click", () => {
+      const nodes = graphModel.getNodes();
+      for (const n of nodes) {
+        n.fx = null;
+        n.fy = null;
+      }
+      buildGraph(true);
     });
   }
 
@@ -946,12 +1134,19 @@ function bindExtensionMessages(): void {
     const message = event.data;
     switch (message.command) {
       case "setData":
+        if (message.searchQuery !== undefined) {
+          const searchInput = document.getElementById("search-input") as HTMLInputElement | null;
+          if (searchInput) {
+            searchInput.value = message.searchQuery;
+          }
+        }
         setData(
           message.nodes as GraphNode[],
           message.edges as GraphEdge[]
         );
-        // Auto-fit after simulation settles a bit
-        setTimeout(() => fitToView(), 800);
+        // Auto-fit after simulation settles a bit. Using a shorter delay since
+        // the simulation ticks are executed synchronously.
+        setTimeout(() => fitToView(), 100);
         // Show truncation warning if needed
         if (message.truncated) {
           const warn = document.getElementById("truncation-warning");
@@ -962,8 +1157,20 @@ function bindExtensionMessages(): void {
         }
         break;
 
+      case "fitView":
+        setTimeout(() => fitToView(true), 100);
+        break;
+
       case "highlightNode":
         highlightNodeByName(message.qualifiedName as string);
+        break;
+
+      case "appendData":
+        appendData(
+          message.nodes as GraphNode[],
+          message.edges as GraphEdge[],
+          message.parentQualifiedName as string | undefined
+        );
         break;
 
       case "setTheme":

@@ -10,7 +10,7 @@ import * as assert from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { SqliteReader, GraphNode, GraphEdge } from '../src/backend/sqlite';
 
 // ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ function createTestDb(): string {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'crg-test-'));
   const dbPath = path.join(tmpDir, 'graph.db');
 
-  const db = new Database(dbPath);
+  const db = new DatabaseSync(dbPath);
   db.exec(SCHEMA_SQL);
 
   const insertNode = db.prepare(`
@@ -216,12 +216,16 @@ function createTestDb(): string {
     'INSERT INTO metadata (key, value) VALUES (?, ?)'
   );
 
-  const insertMany = db.transaction(() => {
+  db.exec('BEGIN');
+  try {
     for (const n of TEST_NODES) { insertNode.run(n); }
     for (const e of TEST_EDGES) { insertEdge.run(e); }
     insertMeta.run('last_updated', '2025-06-15T10:30:00Z');
-  });
-  insertMany();
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
   db.close();
 
   return dbPath;
@@ -371,6 +375,20 @@ describe('SqliteReader', () => {
     assert.deepStrictEqual(edges, []);
   });
 
+  it('getEdgesAmong() handles large set sizes exceeding SQLite variable limits', () => {
+    const qns = new Set<string>();
+    for (let i = 0; i < 1500; i++) {
+      qns.add(`fake_symbol_${i}`);
+    }
+    qns.add('src/routes.py::handle_login');
+    qns.add('src/auth.py::login');
+
+    const edges = reader.getEdgesAmong(qns);
+    assert.strictEqual(edges.length, 1);
+    assert.strictEqual(edges[0].sourceQualified, 'src/routes.py::handle_login');
+    assert.strictEqual(edges[0].targetQualified, 'src/auth.py::login');
+  });
+
   // -- searchNodes --------------------------------------------------------
 
   it('searchNodes() finds nodes by name substring', () => {
@@ -389,6 +407,20 @@ describe('SqliteReader', () => {
   it('searchNodes() returns empty for no match', () => {
     const results = reader.searchNodes('zzz_no_match_zzz');
     assert.deepStrictEqual(results, []);
+  });
+
+  // -- getNodesByKind -----------------------------------------------------
+
+  it('getNodesByKind() returns nodes of specific kind', () => {
+    const results = reader.getNodesByKind('Function');
+    assert.strictEqual(results.length, 3); // login, logout, handle_login
+    const kinds = results.map((n) => n.kind);
+    assert.ok(kinds.every((k) => k === 'Function'));
+  });
+
+  it('getNodesByKind() respects limit', () => {
+    const results = reader.getNodesByKind('Function', 1);
+    assert.strictEqual(results.length, 1);
   });
 
   // -- getStats -----------------------------------------------------------

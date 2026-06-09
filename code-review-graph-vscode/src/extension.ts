@@ -565,7 +565,7 @@ function registerCommands(
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("codeReviewGraph.showGraph", async () => {
+    vscode.commands.registerCommand("codeReviewGraph.showGraph", async (uri?: vscode.Uri) => {
       if (!sqliteReader) {
         vscode.window.showWarningMessage(
           "Code Graph: No graph database loaded. Run 'Code Graph: Build Graph' first."
@@ -573,7 +573,18 @@ function registerCommands(
         return;
       }
 
-      GraphWebviewPanel.createOrShow(context.extensionUri, sqliteReader);
+      // Resolve target file path: prefer the right-clicked URI, then the active editor
+      let targetFilePath: string | undefined;
+      if (uri && uri.scheme === "file") {
+        targetFilePath = uri.fsPath;
+      } else if (vscode.window.activeTextEditor) {
+        const activeDoc = vscode.window.activeTextEditor.document;
+        if (activeDoc.uri.scheme === "file") {
+          targetFilePath = activeDoc.uri.fsPath;
+        }
+      }
+
+      GraphWebviewPanel.createOrShow(context.extensionUri, sqliteReader, undefined, undefined, targetFilePath);
     })
   );
 
